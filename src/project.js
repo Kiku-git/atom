@@ -204,11 +204,11 @@ class Project extends Model {
   //     // absolute path to the filesystem entry that was touched
   //     console.log(`Event path: ${event.path}`)
   //
-  //     if (event.type === 'renamed') {
+  //     if (event.action === 'renamed') {
   //       console.log(`.. renamed from: ${event.oldPath}`)
   //     }
   //   }
-  // }
+  // })
   //
   // disposable.dispose()
   // ```
@@ -232,6 +232,38 @@ class Project extends Model {
   // Returns a {Disposable} to manage this event subscription.
   onDidChangeFiles (callback) {
     return this.emitter.on('did-change-files', callback)
+  }
+
+  // Public: Invoke the given callback with all current and future
+  // repositories in the project.
+  //
+  // * `callback` {Function} to be called with current and future
+  //    repositories.
+  //   * `repository` A {GitRepository} that is present at the time of
+  //     subscription or that is added at some later time.
+  //
+  // Returns a {Disposable} on which `.dispose()` can be called to
+  // unsubscribe.
+  observeRepositories (callback) {
+    for (const repo of this.repositories) {
+      if (repo != null) {
+        callback(repo)
+      }
+    }
+
+    return this.onDidAddRepository(callback)
+  }
+
+  // Public: Invoke the given callback when a repository is added to the
+  // project.
+  //
+  // * `callback` {Function} to be called when a repository is added.
+  //   * `repository` A {GitRepository}.
+  //
+  // Returns a {Disposable} on which `.dispose()` can be called to
+  // unsubscribe.
+  onDidAddRepository (callback) {
+    return this.emitter.on('did-add-repository', callback)
   }
 
   /*
@@ -400,20 +432,29 @@ class Project extends Model {
       if (repo) { break }
     }
     this.repositories.push(repo != null ? repo : null)
+    if (repo != null) {
+      this.emitter.emit('did-add-repository', repo)
+    }
 
     if (options.emitEvent !== false) {
       this.emitter.emit('did-change-paths', this.getPaths())
     }
   }
 
-  getDirectoryForProjectPath (projectPath) {
-    let directory = null
+  getProvidedDirectoryForProjectPath (projectPath) {
     for (let provider of this.directoryProviders) {
       if (typeof provider.directoryForURISync === 'function') {
-        directory = provider.directoryForURISync(projectPath)
-        if (directory) break
+        const directory = provider.directoryForURISync(projectPath)
+        if (directory) {
+          return directory
+        }
       }
     }
+    return null
+  }
+
+  getDirectoryForProjectPath (projectPath) {
+    let directory = this.getProvidedDirectoryForProjectPath(projectPath)
     if (directory == null) {
       directory = this.defaultDirectoryProvider.directoryForURISync(projectPath)
     }
@@ -685,9 +726,6 @@ class Project extends Model {
     }
 
     this.grammarRegistry.autoAssignLanguageMode(buffer)
-    if (buffer.languageMode.initialize) {
-      await buffer.languageMode.initialize()
-    }
 
     this.addBuffer(buffer)
     return buffer

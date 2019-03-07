@@ -1,5 +1,6 @@
 const crypto = require('crypto')
 const path = require('path')
+const util = require('util')
 const {ipcRenderer} = require('electron')
 
 const _ = require('underscore-plus')
@@ -44,6 +45,8 @@ const TextBuffer = require('text-buffer')
 const TextEditorRegistry = require('./text-editor-registry')
 const AutoUpdateManager = require('./auto-update-manager')
 
+const stat = util.promisify(fs.stat)
+
 let nextId = 0
 
 // Essential: Atom global for dealing with packages, themes, menus, and the window.
@@ -64,7 +67,7 @@ class AtomEnvironment {
     this.applicationDelegate = params.applicationDelegate
 
     this.nextProxyRequestId = 0
-    this.unloaded = false
+    this.unloading = false
     this.loadTime = null
     this.emitter = new Emitter()
     this.disposables = new CompositeDisposable()
@@ -280,7 +283,7 @@ class AtomEnvironment {
   attachSaveStateListeners () {
     const saveState = _.debounce(() => {
       this.window.requestIdleCallback(() => {
-        if (!this.unloaded) this.saveState({isUnloading: false})
+        if (!this.unloading) this.saveState({isUnloading: false})
       })
     }, this.saveStateDebounceInterval)
     this.document.addEventListener('mousedown', saveState, true)
@@ -487,21 +490,25 @@ class AtomEnvironment {
 
   // Public: Gets the release channel of the Atom application.
   //
-  // Returns the release channel as a {String}. Will return one of `dev`, `beta`, or `stable`.
+  // Returns the release channel as a {String}. Will return a specific release channel
+  // name like 'beta' or 'nightly' if one is found in the Atom version or 'stable'
+  // otherwise.
   getReleaseChannel () {
-    const version = this.getVersion()
-    if (version.includes('beta')) {
-      return 'beta'
-    } else if (version.includes('dev')) {
-      return 'dev'
-    } else {
-      return 'stable'
+    // This matches stable, dev (with or without commit hash) and any other
+    // release channel following the pattern '1.00.0-channel0'
+    const match = this.getVersion().match(/\d+\.\d+\.\d+(-([a-z]+)(\d+|-\w{4,})?)?$/)
+    if (!match) {
+      return 'unrecognized'
+    } else if (match[2]) {
+      return match[2]
     }
+
+    return 'stable'
   }
 
   // Public: Returns a {Boolean} that is `true` if the current version is an official release.
   isReleasedVersion () {
-    return !/\w{7}/.test(this.getVersion()) // Check if the release is a 7-character SHA prefix
+    return this.getReleaseChannel().match(/stable|beta|nightly/) != null
   }
 
   // Public: Get the time taken to completely load the current window.
@@ -771,7 +778,7 @@ class AtomEnvironment {
       await this.stateStore.clear()
     }
 
-    this.unloaded = false
+    this.unloading = false
 
     const updateProcessEnvPromise = this.updateProcessEnvAndTriggerHooks()
 
@@ -796,21 +803,7 @@ class AtomEnvironment {
       this.disposables.add(this.applicationDelegate.onApplicationMenuCommand(this.dispatchApplicationMenuCommand.bind(this)))
       this.disposables.add(this.applicationDelegate.onContextMenuCommand(this.dispatchContextMenuCommand.bind(this)))
       this.disposables.add(this.applicationDelegate.onURIMessage(this.dispatchURIMessage.bind(this)))
-      this.disposables.add(this.applicationDelegate.onDidRequestUnload(async () => {
-        try {
-          await this.saveState({isUnloading: true})
-        } catch (error) {
-          console.error(error)
-        }
-
-        const closing = !this.workspace || await this.workspace.confirmClose({
-          windowCloseRequested: true,
-          projectHasPaths: this.project.getPaths().length > 0
-        })
-
-        if (closing) await this.packages.deactivatePackages()
-        return closing
-      }))
+      this.disposables.add(this.applicationDelegate.onDidRequestUnload(this.prepareToUnloadEditorWindow.bind(this)))
 
       this.listenForUpdates()
 
@@ -889,12 +882,30 @@ class AtomEnvironment {
     }
   }
 
+  async prepareToUnloadEditorWindow () {
+    try {
+      await this.saveState({isUnloading: true})
+    } catch (error) {
+      console.error(error)
+    }
+
+    const closing = !this.workspace || await this.workspace.confirmClose({
+      windowCloseRequested: true,
+      projectHasPaths: this.project.getPaths().length > 0
+    })
+
+    if (closing) {
+      this.unloading = true
+      await this.packages.deactivatePackages()
+    }
+    return closing
+  }
+
   unloadEditorWindow () {
     if (!this.project) return
 
     this.storeWindowBackground()
     this.saveBlobStoreSync()
-    this.unloaded = true
   }
 
   saveBlobStoreSync () {
@@ -1002,6 +1013,7 @@ class AtomEnvironment {
   //     window.alert('bummer')
   //   }
   // })
+  // ```
   //
   // ```js
   // // Legacy sync version
@@ -1350,42 +1362,71 @@ or use Pane::saveItemAs for programmatic saving.`)
 
   async openLocations (locations) {
     const needsProjectPaths = this.project && this.project.getPaths().length === 0
-    const foldersToAddToProject = []
+    const foldersToAddToProject = new Set()
     const fileLocationsToOpen = []
+    const missingFolders = []
 
-    function pushFolderToOpen (folder) {
-      if (!foldersToAddToProject.includes(folder)) {
-        foldersToAddToProject.push(folder)
-      }
-    }
+    // Asynchronously fetch stat information about each requested path to open.
+    const locationStats = await Promise.all(
+      locations.map(async location => {
+        const stats = location.pathToOpen ? await stat(location.pathToOpen).catch(() => null) : null
+        return {location, stats}
+      }),
+    )
 
-    for (const location of locations) {
+    for (const {location, stats} of locationStats) {
       const {pathToOpen} = location
-      if (pathToOpen && (needsProjectPaths || location.forceAddToWindow)) {
-        if (fs.existsSync(pathToOpen)) {
-          pushFolderToOpen(this.project.getDirectoryForProjectPath(pathToOpen).getPath())
-        } else if (fs.existsSync(path.dirname(pathToOpen))) {
-          pushFolderToOpen(this.project.getDirectoryForProjectPath(path.dirname(pathToOpen)).getPath())
-        } else {
-          pushFolderToOpen(this.project.getDirectoryForProjectPath(pathToOpen).getPath())
-        }
+      if (!pathToOpen) {
+        // Untitled buffer
+        fileLocationsToOpen.push(location)
+        continue
       }
 
-      if (!fs.isDirectorySync(pathToOpen)) {
-        fileLocationsToOpen.push(location)
+      if (stats !== null) {
+        // Path exists
+        if (stats.isDirectory()) {
+          // Directory: add as a project folder
+          foldersToAddToProject.add(this.project.getDirectoryForProjectPath(pathToOpen).getPath())
+        } else if (stats.isFile()) {
+          if (location.mustBeDirectory) {
+            // File: no longer a directory
+            missingFolders.push(location)
+          } else {
+            // File: add as a file location
+            fileLocationsToOpen.push(location)
+          }
+        }
+      } else {
+        // Path does not exist
+        // Attempt to interpret as a URI from a non-default directory provider
+        const directory = this.project.getProvidedDirectoryForProjectPath(pathToOpen)
+        if (directory) {
+          // Found: add as a project folder
+          foldersToAddToProject.add(directory.getPath())
+        } else if (location.mustBeDirectory) {
+          // Not found and must be a directory: add to missing list and use to derive state key
+          missingFolders.push(location)
+        } else {
+          // Not found: open as a new file
+          fileLocationsToOpen.push(location)
+        }
       }
 
       if (location.hasWaitSession) this.pathsWithWaitSessions.add(pathToOpen)
     }
 
     let restoredState = false
-    if (foldersToAddToProject.length > 0) {
-      const state = await this.loadState(this.getStateKey(foldersToAddToProject))
+    if (foldersToAddToProject.size > 0 || missingFolders.length > 0) {
+      // Include missing folders in the state key so that sessions restored with no-longer-present project root folders
+      // don't lose data.
+      const foldersForStateKey = Array.from(foldersToAddToProject)
+        .concat(missingFolders.map(location => location.pathToOpen))
+      const state = await this.loadState(this.getStateKey(Array.from(foldersForStateKey)))
 
       // only restore state if this is the first path added to the project
       if (state && needsProjectPaths) {
         const files = fileLocationsToOpen.map((location) => location.pathToOpen)
-        await this.attemptRestoreProjectStateForPaths(state, foldersToAddToProject, files)
+        await this.attemptRestoreProjectStateForPaths(state, Array.from(foldersToAddToProject), files)
         restoredState = true
       } else {
         for (let folder of foldersToAddToProject) {
@@ -1400,6 +1441,33 @@ or use Pane::saveItemAs for programmatic saving.`)
         fileOpenPromises.push(this.workspace && this.workspace.open(pathToOpen, {initialLine, initialColumn}))
       }
       await Promise.all(fileOpenPromises)
+    }
+
+    if (missingFolders.length > 0) {
+      let message = 'Unable to open project folder'
+      if (missingFolders.length > 1) {
+        message += 's'
+      }
+
+      let description = 'The '
+      if (missingFolders.length === 1) {
+        description += 'directory `'
+        description += missingFolders[0].pathToOpen
+        description += '` does not exist.'
+      } else if (missingFolders.length === 2) {
+        description += `directories \`${missingFolders[0].pathToOpen}\` `
+        description += `and \`${missingFolders[1].pathToOpen}\` do not exist.`
+      } else {
+        description += 'directories '
+        description += (missingFolders
+          .slice(0, -1)
+          .map(location => location.pathToOpen)
+          .map(pathToOpen => '`' + pathToOpen + '`, ')
+          .join(''))
+        description += 'and `' + missingFolders[missingFolders.length - 1].pathToOpen + '` do not exist.'
+      }
+
+      this.notifications.addWarning(message, {description})
     }
 
     ipcRenderer.send('window-command', 'window:locations-opened')

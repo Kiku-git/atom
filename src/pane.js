@@ -41,13 +41,13 @@ class Pane {
       )
     }
 
-    return new Pane(Object.assign(state, {
+    return new Pane(Object.assign({
       deserializerManager: deserializers,
       notificationManager: notifications,
       viewRegistry: views,
       config,
       applicationDelegate
-    }))
+    }, state))
   }
 
   constructor (params = {}) {
@@ -614,15 +614,15 @@ class Pane {
 
     if (this.items.includes(item)) return
 
+    const itemSubscriptions = new CompositeDisposable()
+    this.subscriptionsPerItem.set(item, itemSubscriptions)
     if (typeof item.onDidDestroy === 'function') {
-      const itemSubscriptions = new CompositeDisposable()
       itemSubscriptions.add(item.onDidDestroy(() => this.removeItem(item, false)))
-      if (typeof item.onDidTerminatePendingState === 'function') {
-        itemSubscriptions.add(item.onDidTerminatePendingState(() => {
-          if (this.getPendingItem() === item) this.clearPendingItem()
-        }))
-      }
-      this.subscriptionsPerItem.set(item, itemSubscriptions)
+    }
+    if (typeof item.onDidTerminatePendingState === 'function') {
+      itemSubscriptions.add(item.onDidTerminatePendingState(() => {
+        if (this.getPendingItem() === item) this.clearPendingItem()
+      }))
     }
 
     this.items.splice(index, 0, item)
